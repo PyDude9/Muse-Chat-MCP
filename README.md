@@ -27,6 +27,7 @@ Plus a tiny **CLI** (`muse-cli.mjs`) for one-shot generation from scripts.
 - **Sessions & media** — list/open/read/send in any Muse chat, and pull out the images/videos Muse generates (links + download).
 - **Muse Manual** — a living guide to Muse's video/image/content capabilities at [`manual/MUSE_MANUAL.md`](manual/MUSE_MANUAL.md), regenerated with `node manual/interview.mjs`.
 - **Reuses your existing login** via a dedicated Chrome profile, or attaches to a Chrome you already run with `--remote-debugging-port=9222`.
+- **No windows, ever** (after the one-time `npm run login`): headless runs use a *copy* of the profile, so nothing is locked and several instances can share one login.
 - **Never kills your browser**: when attached over CDP it only *disconnects* on close.
 - **Resilient**: if the profile is locked by a running Chrome, it auto-attaches over CDP instead of failing.
 - **Correct streaming**: only stable, monotonic text is emitted, so a rewrite mid-answer never duplicates.
@@ -56,10 +57,22 @@ npm install
 ## First run (log in once)
 
 ```bash
-npm run selftest          # launches Chrome, prints login/browser state, then closes
+npm run login            # opens a visible Chrome window to sign in to Meta
 ```
 
-A Chrome window opens to `https://muse.ai`. Sign in with your Meta account. The session is stored in a dedicated profile (`.muse-profile/`, git-ignored) and reused afterwards. When `muse_status` reports `"loggedIn": true`, you're ready.
+A Chrome window opens to `https://muse.ai`. Sign in with your Meta account. When sign-in
+completes, the window closes and every later run launches Chrome **headless** — no window,
+no profile lock, and you can run several instances at once. `muse_status` reports
+`"loggedIn": true` when you're ready.
+
+The one-time login uses a dedicated persistent profile (`.muse-profile/`, git-ignored).
+Headless runs copy that profile to `.muse-headless-profile/`, so the original is never locked.
+
+> **Why a profile copy instead of cookies?** Muse keeps its device session in the profile's
+> **IndexedDB + localStorage**, not only in cookies. Exporting cookies alone (`storageState`)
+> gets you `401 hatchAdmissionInvalidated` from `POST /api/auth/check`. Copying the profile
+> keeps the full session, and because the copy is separate, multiple headless instances can
+> share one login without fighting over the profile lock.
 
 ---
 
@@ -248,7 +261,8 @@ MCP client (Claude Desktop / opencode / …)      OpenAI client (SDK / opencode 
                        ▼
                  muse-driver.mjs        playwright-core
                        ▼
-        Chrome (dedicated profile ./.muse-profile)  ──►  https://muse.ai
+   headless Chrome  ──►  https://muse.ai   (copy of .muse-profile -> .muse-headless-profile,
+                                         no window, no profile lock)
 ```
 
 ### Why a browser driver?
@@ -329,11 +343,15 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MUSE_PROFILE_DIR` | `./.muse-profile` | dedicated Chrome profile (holds your login) |
+| `MUSE_PROFILE_DIR` | `./.muse-profile` | dedicated Chrome profile for one-time login |
 | `MUSE_URL` | `https://muse.ai/` | app URL |
 | `MUSE_CHANNEL` | `chrome` | `chrome` or `msedge` |
-| `MUSE_HEADLESS=1` | off | run headless (log in headed first) |
+| `MUSE_HEADLESS=1` | off | force headless (default once you have logged in once) |
+| `MUSE_HEADLESS=0` | – | force a visible window (e.g. to log in again) |
+| `MUSE_HEADLESS_PROFILE` | `./.muse-headless-profile` | throwaway profile copy used for headless runs |
 | `MUSE_CDP` | – | attach to an existing Chrome at this URL (e.g. `http://127.0.0.1:9222`) instead of launching |
+| `MUSE_SEND_LOCK` | `./.muse-send.lock` | cross-process send lock dir (set to share across checkouts) |
+| `MUSE_SEND_LOCK_TTL_MS` | `600000` | reclaim the send lock if its holder dies/goes stale |
 | `MUSE_STREAM_QUIET_MS` | `600` | streaming stability window (skip mid-message draft rewrites) |
 | `MUSE_LAUNCH_TIMEOUT_MS` | `60000` | launch / navigation timeout |
 | `MUSE_SHIM_PORT` | `8787` | shim port (`0` disables the shim) |
@@ -347,7 +365,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 
 ## Troubleshooting
 
-- **`loggedIn: false`** → run `muse_login` (or `npm run selftest`) and sign in in the Chrome window.
+- **`loggedIn: false`** → run `npm run login` (or `muse_login`) and sign in in the Chrome window. Headless runs use a copy of the logged-in profile, so this is only needed when your session expires.
 - **`composerReady: false`** after login → `node muse-server.mjs --dump-dom`; if the DOM changed, re-derive selectors and update `SELECTORS` in `muse-driver.mjs`.
 - **Empty reply / `timedOut`** → raise `timeout_sec`; agent tasks (browsing, VM work) can take minutes. `needsApproval: true` means Muse is waiting on an in-app approval you must click.
 - **Chrome profile locked** → expected if a Chrome already uses `.muse-profile`. The driver auto-attaches to `http://127.0.0.1:9222` in that case; otherwise close that window, or start Chrome with `--remote-debugging-port=9222` and set `MUSE_CDP`.
@@ -356,7 +374,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 ## Limitations
 
 - **One conversation.** Muse is a single persistent thread; the in-app "new chat" control is unreliable. The shim sends the full transcript each call; `x-muse-thread: new` navigates to `/` first (best-effort fresh context).
-- **Serialized** — one browser, requests run one at a time (auto-queued).
+- **Serialized** — one browser per process, requests run one at a time (auto-queued). Sends additionally take a **cross-process lock** (`.muse-send.lock`), because Muse has one Main chat per account: without it two concurrent senders read each other's replies. Set `MUSE_SEND_LOCK=/path` to share a lock across different working directories.
 - **Tool calling is prompt-injected** — best-effort, not a native function-calling API.
 - **DOM-driven** — a Muse UI change can break selectors; `muse_dump_dom` is the escape hatch.
 

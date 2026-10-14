@@ -35,6 +35,7 @@
     "start": "node muse-server.mjs",
     "muse": "node muse-cli.mjs",
     "selftest": "node muse-server.mjs --self-test",
+    "login": "node muse-server.mjs --login",
     "dump": "node muse-server.mjs --dump-dom"
   },
   "engines": {

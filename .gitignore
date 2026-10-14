@@ -5,6 +5,12 @@ package-lock.json
 # the dedicated Chrome profile that holds YOUR login — never commit this
 .muse-profile/
 *.muse-profile/
+# the throwaway headless profile (per-session)
+.muse-headless-profile/
+# cookie storageState for headless auth — never commit this
+.muse-storage-state.json
+# cross-process send lock dir
+.muse-send.lock/
 
 # captures / secrets — never commit
 *.har

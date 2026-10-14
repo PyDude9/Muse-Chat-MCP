@@ -47,9 +47,18 @@ export const SELECTORS = {
 const APP_URL = process.env.MUSE_URL || 'https://muse.ai/'
 const PROFILE_DIR =
   process.env.MUSE_PROFILE_DIR || path.join(__dirname, '.muse-profile')
-const HEADLESS = process.env.MUSE_HEADLESS === '1'
 const CHANNEL = process.env.MUSE_CHANNEL || 'chrome'
 const LAUNCH_TIMEOUT = Number(process.env.MUSE_LAUNCH_TIMEOUT_MS || 60000)
+// Headless runs copy the logged-in persistent profile to this throwaway dir,
+// so we never lock `.muse-profile` and can run several instances at once.
+// Muse keeps its device session in profile IndexedDB + localStorage, so we
+// need the real profile state — not just cookies.
+const HEADLESS_PROFILE = process.env.MUSE_HEADLESS_PROFILE || path.join(__dirname, '.muse-headless-profile')
+// Cross-process send lock: Muse has one Main chat per account, so concurrent
+// senders (other MCP processes, or your own Muse tab) would otherwise cross
+// replies. Held for the duration of a send, reclaimed if the holder dies.
+const LOCK_DIR = process.env.MUSE_SEND_LOCK || path.join(__dirname, '.muse-send.lock')
+const LOCK_TTL_MS = Number(process.env.MUSE_SEND_LOCK_TTL_MS || 600000)
 // Streaming: only surface text that has been stable this long, so we never emit
 // a mid-generation "skeleton" that Muse later rewrites (which would duplicate in
 // an append-only SSE stream).
@@ -64,6 +73,8 @@ class MuseDriver {
     this.browser = null
     this.lastError = null
     this._queue = Promise.resolve()
+    this._headlessActual = false
+    this._headlessStamp = 0
   }
 
   /** Serialize browser actions (one window = one action at a time). */
@@ -73,22 +84,126 @@ class MuseDriver {
     return run
   }
 
+  /**
+   * Cross-process lock around a send.
+   *
+   * `_serial` only serializes *this* process, but Muse is one server-side Main
+   * chat per account: a second Muse-Chat-MCP process (or a real browser tab) can
+   * append to the same thread, and whoever reads the DOM last would otherwise
+   * get the other party's reply. Lock the send window across processes with an
+   * atomic directory create; stale locks are reclaimed after LOCK_TTL_MS.
+   */
+  async _withSendLock(fn) {
+    const deadline = Date.now() + 120000
+    while (!this._acquireLock()) {
+      if (Date.now() > deadline) break // don't hang forever on a stale holder
+      await sleep(500)
+    }
+    try {
+      return await fn()
+    } finally {
+      this._releaseLock()
+    }
+  }
+
+  _acquireLock() {
+    try {
+      fs.mkdirSync(LOCK_DIR) // atomic: succeeds only if we created it
+      try {
+        fs.writeFileSync(path.join(LOCK_DIR, 'owner.json'), JSON.stringify({ pid: process.pid, at: Date.now() }))
+      } catch { /* best effort */ }
+      this._holdsLock = true
+      return true
+    } catch (e) {
+      // Already held — reclaim if the holder died or went stale.
+      try {
+        const st = fs.statSync(LOCK_DIR).mtimeMs
+        let owner = null
+        try { owner = JSON.parse(fs.readFileSync(path.join(LOCK_DIR, 'owner.json'), 'utf8')) } catch { /* ignore */ }
+        const alive = owner && owner.pid ? (() => { try { process.kill(owner.pid, 0); return true } catch { return false } })() : false
+        if (!alive || Date.now() - st > LOCK_TTL_MS) {
+          fs.rmSync(LOCK_DIR, { recursive: true, force: true })
+          return this._acquireLock()
+        }
+      } catch { /* ignore */ }
+      return false
+    }
+  }
+
+  _releaseLock() {
+    if (!this._holdsLock) return
+    try { fs.rmSync(LOCK_DIR, { recursive: true, force: true }) } catch { /* ignore */ }
+    this._holdsLock = false
+  }
+
   isRunning() {
     return !!(this.ctx && this.page && !this.page.isClosed())
   }
 
-  async launch() {
+  /**
+   * Snapshot the logged-in persistent profile into the throwaway headless dir.
+   * Muse keeps its device session in profile IndexedDB + localStorage (cookies
+   * alone are rejected with `401 hatchAdmissionInvalidated`), so headless needs
+   * a full copy. Copying also means `.muse-profile` is never locked, so several
+   * headless instances can run concurrently.
+   */
+  _cloneProfile() {
+    try {
+      if (!fs.existsSync(PROFILE_DIR)) return false
+      fs.rmSync(HEADLESS_PROFILE, { recursive: true, force: true })
+      fs.cpSync(PROFILE_DIR, HEADLESS_PROFILE, { recursive: true })
+      return true
+    } catch (e) {
+      this.lastError = `could not clone profile: ${String((e && e.message) || e)}`
+      return false
+    }
+  }
+
+  /** Newest mtime under the profile, or 0 if it is missing. */
+  _profileStamp() {
+    let newest = 0
+    const walk = (dir, depth) => {
+      if (depth > 6) return
+      let entries
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+      for (const e of entries) {
+        if (e.name === 'SingletonLock' || e.name === 'SingletonSocket' || e.name === 'SingletonCookie') continue
+        const full = path.join(dir, e.name)
+        if (e.isDirectory()) { walk(full, depth + 1); continue }
+        try { const m = fs.statSync(full).mtimeMs; if (m > newest) newest = m } catch { /* ignore */ }
+      }
+    }
+    walk(PROFILE_DIR, 0)
+    return newest
+  }
+
+  async launch({ headed = false, profile = null } = {}) {
     if (this.isRunning()) return this.page
     const { chromium } = await import('playwright-core')
 
-    const launchPersistent = () =>
-      chromium.launchPersistentContext(PROFILE_DIR, {
+    // Headed only for the interactive login (or an explicit MUSE_HEADLESS=0);
+    // every other run is headless so no window pops up.
+    const useHeadless = !headed && process.env.MUSE_HEADLESS !== '0'
+    const persistDir = profile || (useHeadless ? HEADLESS_PROFILE : PROFILE_DIR)
+    // Headless needs the real profile state (IndexedDB + localStorage), so
+    // snapshot the logged-in profile into a throwaway dir first. Only re-copy
+    // when the source changed (it is ~170 MB).
+    if (useHeadless && !profile) {
+      const stamp = this._profileStamp()
+      if (!fs.existsSync(HEADLESS_PROFILE) || stamp > this._headlessStamp) this._cloneProfile()
+      this._headlessStamp = stamp
+    }
+
+    const launchPersistent = (profileDir, opts = {}) =>
+      chromium.launchPersistentContext(profileDir, {
         channel: CHANNEL,
-        headless: HEADLESS,
+        headless: useHeadless,
         viewport: { width: 1366, height: 900 },
         acceptDownloads: false,
         ignoreDefaultArgs: ['--enable-automation'],
+        ...opts,
         args: [
+          ...(opts.args || []),
           '--no-first-run',
           '--no-default-browser-check',
           '--disable-blink-features=AutomationControlled',
@@ -100,24 +215,26 @@ class MuseDriver {
       this.ctx = this.browser.contexts()[0] || (await this.browser.newContext())
     }
 
+    // Explicit CDP attach (user-managed browser). Never owned by us.
     if (process.env.MUSE_CDP) {
-      // Escape hatch: attach to a Chrome you already started with
-      //   chrome.exe --remote-debugging-port=9222
-      // Reuses all your existing logins; the driver will not own the browser.
       try {
         await attachCDP(process.env.MUSE_CDP)
       } catch (e) {
         this.browser = null
         this.ctx = null
-        this.ctx = await launchPersistent()
+        this.ctx = await launchPersistent(persistDir)
       }
-    } else {
+    }
+    // Headless: dedicated throwaway profile so we never touch / lock .muse-profile.
+    else if (useHeadless) {
+      this._headlessActual = true
+      this.ctx = await launchPersistent(HEADLESS_PROFILE)
+    }
+    // Headed (first-run login, or MUSE_HEADLESS=0): use the persistent profile.
+    else {
       try {
-        this.ctx = await launchPersistent()
+        this.ctx = await launchPersistent(PROFILE_DIR)
       } catch (e) {
-        // The profile is probably locked by an already-running Chrome (e.g. one
-        // started with --remote-debugging-port=9222). Attach to it instead of
-        // failing; only if nothing is listening on the CDP port do we rethrow.
         const msg = String((e && e.message) || e)
         if (!/singleton|lock|profile|already running|browser is already/i.test(msg)) throw e
         try {
@@ -195,8 +312,10 @@ class MuseDriver {
   async status() {
     const running = this.isRunning()
     const url = running ? this.page.url() : null
+    const headless = this._headlessActual
+    const base = { profileDir: PROFILE_DIR, headless, headlessProfileDir: HEADLESS_PROFILE }
     if (!running) {
-      return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: PROFILE_DIR, headless: HEADLESS }
+      return { browserRunning: false, url: null, loggedIn: false, composerReady: false, ...base }
     }
     const auth = await this.checkAuth()
     const composerReady = await this.hasComposer()
@@ -206,13 +325,13 @@ class MuseDriver {
       loggedIn: auth.ok,
       viewerId: auth.viewerId || null,
       composerReady,
-      profileDir: PROFILE_DIR,
-      headless: HEADLESS,
+      ...base,
     }
   }
 
   /** Open the app and, if needed, wait for the user to complete Meta login. */
   async login(timeoutMs = 300000) {
+    await this.launch({ headed: true }) // re-login must pop a visible window
     await this.gotoApp()
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
@@ -221,6 +340,23 @@ class MuseDriver {
       await sleep(2000)
     }
     return { loggedIn: false, hint: 'Complete the Meta sign-in in the opened Chrome window, then call muse_login again or muse_status.' }
+  }
+
+  /**
+   * Refresh the throwaway headless profile from the logged-in one, so the next
+   * headless run picks up the current session. No-op while the login window is
+   * still open (the profile is locked then).
+   */
+  async syncHeadlessProfile() {
+    if (!fs.existsSync(PROFILE_DIR)) return { ok: false, reason: 'no profile' }
+    try {
+      fs.rmSync(HEADLESS_PROFILE, { recursive: true, force: true })
+      fs.cpSync(PROFILE_DIR, HEADLESS_PROFILE, { recursive: true })
+      this._headlessStamp = this._profileStamp()
+      return { ok: true, dir: HEADLESS_PROFILE }
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) }
+    }
   }
 
   async _newChat() {
@@ -357,7 +493,7 @@ class MuseDriver {
       }
     }
 
-    const before = await p.locator(SELECTORS.assistant).count()
+    const before0 = await p.locator(SELECTORS.assistant).count()
 
     // Focus + fill the composer. insertText is O(1) for big prompts;
     // fall back to per-key typing if the editor ignores it.
@@ -387,6 +523,32 @@ class MuseDriver {
       const slot = p.locator(`${SELECTORS.actionSlot} button`).last()
       if (await slot.count()) { await slot.click({ timeout: 5000 }).catch(() => {}) }
       await p.keyboard.press('Control+Enter').catch(() => {})
+    }
+
+    // Confirm OUR message actually landed. The transcript renders in batches a few
+    // seconds after send (nothing is in the DOM before that), and another Muse
+    // session on this account can append messages while we wait — so we anchor
+    // on our own user bubble before trusting any assistant reply.
+    let userSent = !prompt
+    let before = before0
+    if (prompt) {
+      const anchor = Date.now() + 30000
+      const want = prompt.replace(/\s+/g, ' ').trim().slice(0, 40)
+      const norm = (s) => (s || '').replace(/^(You:|User message:|Assistant message:)\s*/i, '').replace(/\s+/g, ' ').trim()
+      while (Date.now() < anchor) {
+        const users = p.locator(SELECTORS.user)
+        if (await users.count()) {
+          // Our turn is the newest user bubble (Muse shows it before replying).
+          const mine = await users.last().innerText().catch(() => '')
+          if (norm(mine).slice(0, 40) === want) {
+            userSent = true
+            // Anchor past any assistant reply that landed before ours.
+            before = Math.max(before0, (await p.locator(SELECTORS.assistant).count()) - 1)
+            break
+          }
+        }
+        await sleep(400)
+      }
     }
 
     // Wait for the reply to complete.
@@ -441,13 +603,14 @@ class MuseDriver {
       elapsedMs: Date.now() - t0,
       ...(this.lastError ? { error: this.lastError } : {}),
       ...(timedOut ? { timedOut: true } : {}),
+      ...(prompt && !userSent ? { sendUnconfirmed: true } : {}),
       ...(needsApproval ? { needsApproval: true } : {}),
     }
   }
 
   /** Send a prompt and wait for the full assistant reply. */
   async chat(prompt, opts = {}) {
-    return this._serial(() => this._run(prompt, opts))
+    return this._serial(() => this._withSendLock(() => this._run(prompt, opts)))
   }
 
   /**
@@ -455,7 +618,7 @@ class MuseDriver {
    * @param {(fullText:string)=>void} opts.onDelta called with the cumulative reply text
    */
   async chatStream(prompt, opts = {}) {
-    return this._serial(() => this._run(prompt, opts))
+    return this._serial(() => this._withSendLock(() => this._run(prompt, opts)))
   }
 
   async readLast() {
@@ -663,6 +826,7 @@ class MuseDriver {
   }
 
   async close() {
+    this._releaseLock()
     if (this.browser) {
       // CDP-attached: disconnect only, never kill the user's browser.
       await this.browser.close().catch(() => {})

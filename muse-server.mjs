@@ -18,7 +18,9 @@
  * Config (env):
  *   MUSE_PROFILE_DIR   dedicated Chrome profile (default: ./.muse-profile)
  *   MUSE_URL           app URL (default https://muse.ai/)
- *   MUSE_HEADLESS=1    run headless (login must be done beforehand)
+ *   MUSE_HEADLESS=1    force headless; MUSE_HEADLESS=0 force headed (re-login)
+ *   MUSE_HEADLESS_PROFILE  throwaway copy of the profile used for headless runs
+ *   MUSE_CDP           attach over CDP instead of launching
  *   MUSE_CHANNEL       chrome | msedge   (default chrome)
  * ------------------------------------------------------------------
  */
@@ -190,6 +192,20 @@ async function main() {
     log('self-test status:', JSON.stringify(st))
     await driver.close()
     process.exit(0)
+  }
+
+  if (args.includes('--login')) {
+    // One-time interactive login: opens a visible Chrome window to sign in to
+    // Meta, then persists the session to the storageState file so normal runs
+    // go headless (no window, no profile lock).
+    await driver.launch({ headed: true })
+    const res = await driver.login(Number(process.env.MUSE_LOGIN_TIMEOUT_MS || 300000))
+    log('login result:', JSON.stringify(res))
+    await driver.close() // release the profile lock before copying it
+    // Refresh the throwaway headless profile so future runs are logged in and
+    // never need a window.
+    if (res.loggedIn) log('headless profile sync:', JSON.stringify(await driver.syncHeadlessProfile()))
+    process.exit(res.loggedIn ? 0 : 1)
   }
 
   if (args.includes('--dump-dom')) {
